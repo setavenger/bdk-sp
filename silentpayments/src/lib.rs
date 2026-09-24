@@ -11,6 +11,11 @@ pub mod receive;
 pub mod send;
 pub use bitcoin;
 
+/// Maximum number of silent payment outputs a single recipient group (same scan key) may
+/// receive in one transaction, as defined by BIP-352. A receiver stops scanning once `k`
+/// reaches this value, so outputs with `k >= K_MAX` are never detected.
+pub const K_MAX: u32 = 2323;
+
 /// NUM Point used to prune key path spend in taproot
 pub const NUMS_H: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
