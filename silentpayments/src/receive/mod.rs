@@ -1,7 +1,7 @@
 pub use self::error::SpReceiveError;
 use crate::{
     hashes::{get_input_hash, get_shared_secret},
-    tag_txin, LexMin, SpInputs,
+    tag_txin, LexMin, SpInputs, K_MAX,
 };
 
 use bitcoin::{
@@ -113,14 +113,18 @@ pub fn scan_txouts(
     let mut matched_tweaks = 0_u32;
     let mut spouts_found = Vec::<SpOut>::new();
 
-    while let Some(spout) = find_spout_for_tweak(
-        &secp,
-        spend_pk,
-        label_lookup,
-        &ecdh_shared_secret,
-        matched_tweaks,
-        &mut outputs_to_check,
-    ) {
+    // BIP-352: stop once k reaches K_max, outputs with k >= K_MAX are not valid silent payments.
+    while matched_tweaks < K_MAX {
+        let Some(spout) = find_spout_for_tweak(
+            &secp,
+            spend_pk,
+            label_lookup,
+            &ecdh_shared_secret,
+            matched_tweaks,
+            &mut outputs_to_check,
+        ) else {
+            break;
+        };
         spouts_found.push(spout);
         matched_tweaks += 1;
     }
@@ -285,6 +289,77 @@ pub fn compute_tweak_data(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    mod scan_txouts {
+        use crate::{
+            receive::{get_silentpayment_script_pubkey, scan_txouts},
+            K_MAX,
+        };
+        use bitcoin::{
+            absolute::LockTime,
+            secp256k1::{PublicKey, Secp256k1, SecretKey},
+            transaction::Version,
+            Amount, Transaction, TxOut,
+        };
+        use std::collections::BTreeMap;
+
+        /// A transaction paying `n` outputs to the same recipient, with k = 0..n. The output for
+        /// `k` carries `k` sats so tests can tell which outputs were found.
+        ///
+        /// Outputs are ordered `[0, n-1, n-2, ..., 1]`: the matcher `swap_remove`s each hit, which
+        /// moves the last output to the front, so every lookup hits index 0 and the test stays
+        /// linear instead of quadratic in `n`. The order does not change which outputs match.
+        fn tx_with_outputs_for_one_recipient(n: u32) -> (PublicKey, PublicKey, Transaction) {
+            let secp = Secp256k1::new();
+            let spend_pk = SecretKey::from_slice(&[0x11; 32])
+                .expect("valid key")
+                .public_key(&secp);
+            let ecdh_shared_secret = SecretKey::from_slice(&[0x22; 32])
+                .expect("valid key")
+                .public_key(&secp);
+            let output = (0..n.min(1))
+                .chain((1..n).rev())
+                .map(|k| TxOut {
+                    value: Amount::from_sat(k.into()),
+                    script_pubkey: get_silentpayment_script_pubkey(
+                        &spend_pk,
+                        &ecdh_shared_secret,
+                        k,
+                        None,
+                    ),
+                })
+                .collect();
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output,
+            };
+            (spend_pk, ecdh_shared_secret, tx)
+        }
+
+        #[test]
+        fn stops_at_k_max() {
+            let (spend_pk, ecdh_shared_secret, tx) = tx_with_outputs_for_one_recipient(K_MAX + 1);
+            let found = scan_txouts(spend_pk, &BTreeMap::new(), &tx, ecdh_shared_secret)
+                .expect("scan succeeds");
+
+            assert_eq!(found.len(), K_MAX as usize);
+            // Every output with k < K_MAX is found, the output with k == K_MAX is not.
+            let mut ks = found.iter().map(|o| o.amount.to_sat()).collect::<Vec<_>>();
+            ks.sort_unstable();
+            assert_eq!(ks, (0..u64::from(K_MAX)).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn finds_all_outputs_below_k_max() {
+            let (spend_pk, ecdh_shared_secret, tx) = tx_with_outputs_for_one_recipient(3);
+            let found = scan_txouts(spend_pk, &BTreeMap::new(), &tx, ecdh_shared_secret)
+                .expect("scan succeeds");
+
+            assert_eq!(found.len(), 3);
+        }
+    }
+
     mod extract_pubkey {
         use crate::{receive::extract_pubkey, SpInputs};
         use bitcoin::{
